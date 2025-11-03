@@ -235,3 +235,34 @@ cron.schedule('0 * * * *', async () => {
     }
   }
 }, { timezone: process.env.TZ || 'Asia/Bangkok' });
+
+
+// ใส่ไว้หลังสร้าง app แล้ว
+app.set('trust proxy', true);
+
+// access log แบบเบา ๆ
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now()-start}ms)`);
+  });
+  next();
+});
+
+// กัน request ค้างเกิน 10 วิ
+app.use((req, res, next) => {
+  res.setTimeout(10000, () => {
+    console.error('Request timeout >10s:', req.method, req.originalUrl);
+    if (!res.headersSent) res.status(504).send('Gateway Timeout');
+  });
+  next();
+});
+
+// ... routes ... (/, /healthz, /webhook ฯลฯ)
+
+// global error handler ปิดท้ายสุด
+app.use((err, req, res, next) => {
+  console.error('UNCAUGHT ERROR:', err);
+  if (!res.headersSent) res.status(500).send('Internal Server Error');
+});
+
