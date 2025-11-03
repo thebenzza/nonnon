@@ -1,4 +1,6 @@
+import express from 'express';
 import crypto from 'crypto';
+
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
@@ -13,16 +15,56 @@ import { Client, middleware as lineMw } from '@line/bot-sdk';
  * - Cron: node-cron every hour (Bangkok)
  */
 
-const app = express({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-});
-app.use(express.json());
+const app = express();
 
+// ✅ จับ raw body ให้ทุก request (LINE ต้องใช้)
+// วิธีมาตรฐาน: ใส่ใน express.json({ verify })
+app.use(express.json({
+  verify: (req, res, buf) => {
+    // เก็บทั้ง Buffer และ string ไว้ใช้ได้หลายรูปแบบ
+    req.rawBody = buf;
+  }
+}));
+
+// (ถ้ามี form-urlencoded จากที่อื่น ค่อยใส่เพิ่ม)
+// app.use(express.urlencoded({ extended: false, verify: (req,res,buf)=>{ req.rawBody = buf; } }));
+
+// health
 app.get('/', (_, res) => res.status(200).send('Pet Vaccine Bot (Firebase + Gemini) — OK'));
 app.get('/healthz', (_, res) => res.status(200).json({ ok: true, ts: Date.now() }));
 
+import { middleware as lineMw } from '@line/bot-sdk';
+const lineConfig = { channelSecret: process.env.LINE_CHANNEL_SECRET, channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN };
+
+// ✅ LINE webhook: ต้องมากับ rawBody ที่ตั้งไว้ด้านบนแล้ว
+app.post('/webhook', lineMw(lineConfig), async (req, res) => {
+  // ... handle events ...
+  res.status(200).end();
+});
+
+
+// ใช้ POST เท่านั้น แล้วอย่าลืมลบเมื่อเสร็จงาน
+app.post('/webhook-raw', (req, res) => {
+  try {
+    const headerSig = req.headers['x-line-signature'];
+    const computed = crypto
+      .createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+      .update(req.rawBody)          // ✅ ตอนนี้ req.rawBody เป็น Buffer แล้ว
+      .digest('base64');
+    console.log('[SIGCHECK] header=', headerSig, ' computed=', computed, ' match=', headerSig === computed);
+    res.status(200).send('ok');
+  } catch (e) {
+    console.error('[SIGCHECK_ERROR]', e);
+    res.status(500).send('error');
+  }
+});
+
+
+
+
+
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log('Server running on', port));
+app.listen(port, '0.0.0.0', () => console.log('Server running on', port));
 
 let db;
 (function initFirebaseSafe(){
