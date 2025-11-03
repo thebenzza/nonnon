@@ -1,0 +1,15 @@
+{
+  "name": "line-pet-vaccine-bot-firebase",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "@line/bot-sdk": "^9.0.0",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0",
+    "node-cron": "^3.0.3"
+  }
+}
