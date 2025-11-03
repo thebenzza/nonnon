@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
@@ -264,5 +265,22 @@ app.use((req, res, next) => {
 app.use((err, req, res, next) => {
   console.error('UNCAUGHT ERROR:', err);
   if (!res.headersSent) res.status(500).send('Internal Server Error');
+});
+
+
+// DEBUG ONLY: ลองเปลี่ยน Webhook URL มาที่ /webhook-raw ชั่วคราวเพื่อเช็ค signature
+app.post('/webhook-raw', (req, res) => {
+  try {
+    const headerSig = req.headers['x-line-signature'];
+    const computed = crypto
+      .createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+      .update(req.rawBody)
+      .digest('base64');
+    console.log('[SIGCHECK] header=', headerSig, ' computed=', computed, ' match=', headerSig === computed);
+    res.status(200).send('ok');
+  } catch (e) {
+    console.error('[SIGCHECK_ERROR]', e);
+    res.status(500).send('error');
+  }
 });
 
