@@ -147,12 +147,26 @@ async function ensureOwner(userId, displayName){
 }
 
 async function getLastPetName(userId){
-  const q = await db.collection('pets')
-    .where('owner_user_id','==', userId)
-    .orderBy('updated_at','desc')
-    .limit(1).get();
-  if (q.empty) return null;
-  return q.docs[0].data().name;
+  try {
+    const q = await db.collection('pets')
+      .where('owner_user_id','==', userId)
+      .orderBy('updated_at','desc')
+      .limit(1).get();
+    if (q.empty) return null;
+    return q.docs[0].data().name;
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (msg.includes('FAILED_PRECONDITION') && msg.includes('requires an index')) {
+      console.error('[INDEX_NEEDED] pets(owner_user_id asc, updated_at desc) — using fallback without orderBy');
+      // fallback ชั่วคราว: ตัด orderBy ออก (ผลลัพธ์ไม่การันตีตัวล่าสุด)
+      const q2 = await db.collection('pets')
+        .where('owner_user_id','==', userId)
+        .limit(1).get();
+      if (q2.empty) return null;
+      return q2.docs[0].data().name;
+    }
+    throw e;
+  }
 }
 
 async function setSession(userId, obj){
@@ -500,18 +514,41 @@ async function handleEvent(event){
       }
 
       if (a.type === 'list_vaccine'){
-        const pet = p.pet_name || lastPet || await getLastPetName(userId);
-        if (!pet){
-          replyText ||= 'ยังไม่พบน้องในระบบ บอกชื่อน้องก่อนน้า';
-        } else {
-          const snap = await db.collection('vaccines').where('owner_user_id','==', userId).where('pet_name','==', pet).orderBy('next_due_date','asc').get();
-          if (snap.empty) replyText ||= `ยังไม่มีวัคซีนของ ${pet}`;
-          else {
-            const lines = snap.docs.map(d=>{ const r=d.data(); return `• ${r.vaccine_name} ล่าสุด: ${r.last_shot_date||'-'} นัด: ${r.next_due_date||'-'}`; });
-            replyText ||= runListFormat(lines, `ยังไม่มีวัคซีนของ ${pet}`);
-          }
-        }
+  const pet = p.pet_name || lastPet || await getLastPetName(userId);
+  if (!pet){
+    replyText ||= 'ยังไม่พบน้องในระบบ บอกชื่อน้องก่อนน้า';
+  } else {
+    try {
+      const snap = await db.collection('vaccines')
+        .where('owner_user_id','==', userId)
+        .where('pet_name','==', pet)
+        .orderBy('next_due_date','asc')
+        .get();
+      if (snap.empty) replyText ||= `ยังไม่มีวัคซีนของ ${pet}`;
+      else {
+        const lines = snap.docs.map(d=>{ const r=d.data(); return `• ${r.vaccine_name} ล่าสุด: ${r.last_shot_date||'-'} นัด: ${r.next_due_date||'-'}`; });
+        replyText ||= lines.join('\\n');
       }
+    } catch(e) {
+      const msg = String(e?.message || e);
+      if (msg.includes('FAILED_PRECONDITION') && msg.includes('requires an index')) {
+        console.error('[INDEX_NEEDED] vaccines(owner_user_id, pet_name, next_due_date asc) — fallback no order');
+        const snap = await db.collection('vaccines')
+          .where('owner_user_id','==', userId)
+          .where('pet_name','==', pet)
+          .get();
+        if (snap.empty) replyText ||= `ยังไม่มีวัคซีนของ ${pet}`;
+        else {
+          const lines = snap.docs.map(d=>{ const r=d.data(); return `• ${r.vaccine_name} ล่าสุด: ${r.last_shot_date||'-'} นัด: ${r.next_due_date||'-'}`; });
+          replyText ||= lines.join('\\n');
+        }
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
 
       if (a.type === 'add_parasite_prevention'){
         const next = await addParasite(userId, p);
@@ -592,6 +629,16 @@ async function handleEvent(event){
 
   // Postbacks, images, etc. can be added here if needed
 }
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+  // ไม่ process.exit เพื่อไม่ให้ Railway รีสตาร์ทวน
+});
+
 
 // --- Start server ---
 app.listen(cfg.port, () => log('Server running on', cfg.port));
+
+
