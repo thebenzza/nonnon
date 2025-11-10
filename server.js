@@ -217,6 +217,21 @@ cron.schedule('0 * * * *', async () => {
   }
 }, { timezone: process.env.TZ || 'Asia/Bangkok' });
 
+// Debug Firestore: เขียนเอกสารทดสอบลงคอลเลกชัน ping
+app.get('/debug/firestore', async (req, res) => {
+  try {
+    if (!db) throw new Error('db_not_ready');
+    const doc = await db.collection('ping').add({ ts: Date.now() });
+    res.status(200).json({ ok: true, id: doc.id });
+  } catch (e) {
+    console.error('[DEBUG_FIRESTORE]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+
+
 // ---------- Start ----------
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => console.log('Server running on', port));
