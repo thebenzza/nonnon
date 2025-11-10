@@ -62,7 +62,7 @@ const lineClient = new Client(lineConfig);
 // ---------- GEMINI (AI Studio) ----------
 async function geminiCall(model, contents, genCfg = {}) {
   if (!process.env.GEMINI_API_KEY) return null;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
   const body = { contents, generationConfig: { temperature: 0.2, ...genCfg } };
   try {
     const { data } = await axios.post(url, body, { timeout: 15000 });
