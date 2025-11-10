@@ -8,18 +8,21 @@ import { Client, middleware as lineMw } from '@line/bot-sdk';
 
 /**
  * LINE Pet Vaccine Bot — Firebase Firestore + Gemini + Railway
- * ENV ต้องมี:
- * LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN,
- * GEMINI_API_KEY, FIREBASE_SERVICE_ACCOUNT, TZ=Asia/Bangkok
+ * ต้องตั้งค่า ENV:
+ * - LINE_CHANNEL_SECRET
+ * - LINE_CHANNEL_ACCESS_TOKEN
+ * - GEMINI_API_KEY   (AI Studio / Generative Language API)
+ * - FIREBASE_SERVICE_ACCOUNT  (JSON ทั้งก้อน; private_key มี \\n ได้)
+ * - TZ=Asia/Bangkok
  */
 
 // ---------- EXPRESS ----------
 const app = express();
 app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; } // เก็บ raw body ไว้ตรวจ signature
+  verify: (req, res, buf) => { req.rawBody = buf; } // เก็บ raw body ไว้ตรวจ LINE signature
 }));
 
-// Log ทุก request
+// Access log
 app.set('trust proxy', true);
 app.use((req, res, next) => {
   const t = Date.now();
@@ -31,14 +34,16 @@ app.use((req, res, next) => {
 
 app.get('/', (_, res) => res.send('Pet Vaccine Bot (Firebase + Gemini) — OK'));
 app.get('/healthz', (_, res) => res.json({ ok: true, ts: Date.now() }));
-app.get('/version', (_, res) => res.json({ version: 'rb-1.0.4', time: new Date().toISOString() }));
+app.get('/version', (_, res) => res.json({ version: 'g-first-1.0.0', time: new Date().toISOString() }));
 
 // ---------- FIREBASE ----------
 let db;
 (function initFirebaseSafe() {
   try {
     const svc = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    if (svc.private_key && svc.private_key.includes('\\n')) svc.private_key = svc.private_key.replace(/\\n/g, '\n');
+    if (svc.private_key && svc.private_key.includes('\\n') === false && svc.private_key.includes('\\\\n')) {
+      svc.private_key = svc.private_key.replace(/\\\\n/g, '\n');
+    }
     admin.initializeApp({ credential: admin.credential.cert(svc) });
     db = admin.firestore();
     console.log('Firebase initialized');
@@ -55,53 +60,78 @@ const lineConfig = {
 const lineClient = new Client(lineConfig);
 
 // ---------- GEMINI (AI Studio) ----------
-async function geminiParse(text) {
-  if (!process.env.GEMINI_API_KEY) return null; // ไม่มีคีย์ให้ข้าม
+async function geminiCall(model, contents, genCfg = {}) {
+  if (!process.env.GEMINI_API_KEY) return null;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const body = { contents, generationConfig: { temperature: 0.2, ...genCfg } };
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
-    const body = {
-      contents: [
-        { role: 'user', parts: [{ text: 'ให้ตอบเป็น JSON {"intent":"add_pet|add_vaccine|list_vaccine","parameters":{...}} เท่านั้น' }] },
-        { role: 'user', parts: [{ text }] }
-      ]
-    };
     const { data } = await axios.post(url, body, { timeout: 15000 });
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-    const jsonText = raw.replace(/```json|```/g, '').trim();
-    return JSON.parse(jsonText);
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return text;
   } catch (e) {
     if (e.response) console.error('Gemini error:', e.response.status, e.response.data);
     else console.error('Gemini error:', e.message);
-    return null; // ล้มก็ข้าม เพื่อไม่ให้บอทค้าง
+    return null;
   }
+}
+
+// 1) NLU: บังคับตอบ JSON เท่านั้น
+async function geminiNLU(userText) {
+  const sys = `คุณคือ NLU สำหรับ "บอทวัคซีนสัตว์เลี้ยง" ให้ตอบเป็น JSON เท่านั้น
+รูปแบบ:
+{"intent":"add_pet|add_vaccine|list_vaccine|help|smalltalk","parameters":{...}}
+กติกา:
+- add_pet: {"name":"<ชื่อสัตว์>"}
+- add_vaccine: {"pet_name":"<ชื่อ>","vaccine_name":"<ชื่อวัคซีน>","last_shot_date":"YYYY-MM-DD","cycle_days":<วัน>}
+- list_vaccine: {"pet_name":"<อาจว่างได้>"}
+- help / smalltalk: {} 
+ห้ามใส่ข้อความอื่นนอกจาก JSON, ห้ามใช้ code block`;
+  const text = await geminiCall(
+    'gemini-2.5-flash',
+    [
+      { role: 'user', parts: [{ text: sys }] },
+      { role: 'user', parts: [{ text: userText }] }
+    ],
+    { temperature: 0.1 }
+  );
+  if (!text) return null;
+  const cleaned = text.replace(/```json|```/g, '').trim();
+  try { return JSON.parse(cleaned); } catch { return null; }
+}
+
+// 2) Chat: ให้ช่วยร่างคำตอบไทยสั้นๆ/สุภาพ
+async function geminiChat(systemHint, userHint) {
+  const text = await geminiCall(
+    'gemini-2.5-flash',
+    [
+      { role: 'user', parts: [{ text: systemHint }] },
+      { role: 'user', parts: [{ text: userHint }] }
+    ],
+    { temperature: 0.4 }
+  );
+  return text || null;
 }
 
 // ---------- RULE-BASED PARSERS (ไทย) ----------
 function normalizeDate(input) {
   if (!input) return '';
   const s = input.trim();
-  const iso = s.match(/^\d{4}-\d{2}-\d{2}$/);
-  if (iso) return s;
-  const dmy = s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/);
-  if (dmy) {
-    const d = String(dmy[1]).padStart(2,'0');
-    const m = String(dmy[2]).padStart(2,'0');
-    const y = dmy[3];
-    return `${y}-${m}-${d}`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;            // YYYY-MM-DD
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/); // DD/MM/YYYY
+  if (m) {
+    const d = String(m[1]).padStart(2,'0');
+    const mm = String(m[2]).padStart(2,'0');
+    const y = m[3];
+    return `${y}-${mm}-${d}`;
   }
   return '';
 }
 
 function parseAddPet(text) {
   const byKeyword = text.match(/^เพิ่ม(หมา|แมว|สัตว์เลี้ยง)?ชื่อ\s+(.+)$/i);
-  if (byKeyword) {
-    const name = byKeyword[2].trim();
-    return { intent: 'add_pet', name };
-  }
+  if (byKeyword) return { intent: 'add_pet', name: byKeyword[2].trim() };
   const colon = text.match(/^ชื่อ\s*:\s*(.+)$/i);
-  if (colon) {
-    return { intent: 'add_pet', name: colon[1].trim() };
-  }
+  if (colon) return { intent: 'add_pet', name: colon[1].trim() };
   return null;
 }
 
@@ -133,13 +163,10 @@ function parseListVaccine(text) {
   return null;
 }
 
-// ---------- Firestore helper ----------
+// ---------- Firestore helpers ----------
 async function ensureOwner(line_user_id, name='') {
   try {
-    if (!db) {
-      const app = admin.app();
-      db = admin.firestore();
-    }
+    if (!db) { db = admin.firestore(); }
     const ref = db.collection('owners').doc(line_user_id);
     const snap = await ref.get();
     if (!snap.exists) await ref.set({ display_name: name, consent_pdpa_at: admin.firestore.Timestamp.now() });
@@ -156,22 +183,30 @@ function addDays(dateStr, days) {
   return d.toISOString().slice(0,10);
 }
 
-async function addPet(line_user_id, name) {
-  await ensureOwner(line_user_id);
-  await db.collection('pets').add({ owner_user_id: line_user_id, name });
+async function addPet(userId, name) {
+  await ensureOwner(userId);
+  await db.collection('pets').add({ owner_user_id: userId, name });
 }
 
-async function addVaccine(line_user_id, pet_name, vaccine_name, last_shot_date, cycle_days=365) {
+async function addVaccine(userId, pet_name, vaccine_name, last_shot_date, cycle_days=365) {
   const nextDue = addDays(last_shot_date, cycle_days);
   const vRef = await db.collection('vaccines').add({
-    owner_user_id: line_user_id, pet_name, vaccine_name, last_shot_date, next_due_date: nextDue
+    owner_user_id: userId, pet_name, vaccine_name, last_shot_date, next_due_date: nextDue
   });
+  // สร้าง reminders D-7 / D-1 / D0 เวลา 09:00 (+7)
   const reminders = db.collection('reminders');
   const d0 = new Date(nextDue + 'T09:00:00+07:00');
   const d1 = new Date(d0.getTime() - 24*60*60*1000);
   const d7 = new Date(d0.getTime() - 7*24*60*60*1000);
-  for (const [t, dt] of [['D0',d0],['D-1',d1],['D-7',d7]]) {
-    await reminders.add({ owner_user_id: line_user_id, vaccine_id: vRef.id, pet_name, type:t, remind_at: admin.firestore.Timestamp.fromDate(dt), sent:false });
+  for (const [t, dt] of [['D0', d0], ['D-1', d1], ['D-7', d7]]) {
+    await reminders.add({
+      owner_user_id: userId,
+      vaccine_id: vRef.id,
+      pet_name,
+      type: t,
+      remind_at: admin.firestore.Timestamp.fromDate(dt),
+      sent: false
+    });
   }
   return nextDue;
 }
@@ -185,7 +220,10 @@ async function handleEvent(event) {
     try {
       const profile = await lineClient.getProfile(userId);
       await ensureOwner(userId, profile.displayName);
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`สวัสดี ${profile.displayName} 🐾 พิมพ์ "เมนู" เพื่อเริ่มใช้งาน` }]);
+      return lineClient.replyMessage(event.replyToken, [{
+        type: 'text',
+        text: `สวัสดี ${profile.displayName} 🐾 พิมพ์ "เมนู" เพื่อเริ่มใช้งาน`
+      }]);
     } catch (e) {
       console.error('follow error', e.message);
       return;
@@ -196,7 +234,7 @@ async function handleEvent(event) {
     const text = (event.message.text || '').trim();
     console.log('[MSG_IN]', { userId, text });
 
-    // เมนู
+    // เมนูด่วน
     if (/^เมนู$/i.test(text)) {
       return lineClient.replyMessage(event.replyToken, [{
         type:'text',
@@ -204,7 +242,7 @@ async function handleEvent(event) {
       }]);
     }
 
-    // ลบข้อมูล (PDPA)
+    // ลบข้อมูลทั้งหมด (PDPA)
     if (/^ลบข้อมูล$/i.test(text)) {
       try {
         const ownerId = userId;
@@ -226,71 +264,110 @@ async function handleEvent(event) {
     // เชื่อมฐานข้อมูล
     const okOwner = await ensureOwner(userId);
     if (!okOwner) {
-      return lineClient.replyMessage(event.replyToken, [{
-        type:'text',
-        text:'ระบบเชื่อมฐานข้อมูลยังไม่พร้อม กรุณาลองใหม่อีกครั้งครับ/ค่ะ'
-      }]);
+      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'ระบบเชื่อมฐานข้อมูลยังไม่พร้อม กรุณาลองใหม่อีกครั้งครับ/ค่ะ' }]);
     }
 
-    // พาร์สแบบกฎ (ไม่ง้อ Gemini)
-    const p1 = parseAddPet(text);
-    if (p1) {
-      console.log('[PARSE_RULE] add_pet', p1);
-      await addPet(userId, p1.name);
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`เพิ่มสัตว์เลี้ยง "${p1.name}" เรียบร้อย ✅` }]);
+    // === 1) ให้ Gemini NLU นำ ===
+    let nlu = await geminiNLU(text);
+
+    // === 2) ถ้า NLU ล้ม/ไม่ชัด → rule-based fallback ===
+    if (!nlu) {
+      const p1 = parseAddPet(text);
+      if (p1) nlu = { intent: 'add_pet', parameters: { name: p1.name } };
+
+      const p2 = !nlu && parseAddVaccine(text);
+      if (p2) nlu = { intent: 'add_vaccine', parameters: { pet_name: p2.pet, vaccine_name: p2.vaccine, last_shot_date: p2.date, cycle_days: p2.cycle } };
+
+      const p3 = !nlu && parseListVaccine(text);
+      if (p3) nlu = { intent: 'list_vaccine', parameters: { pet_name: p3.pet } };
     }
 
-    const p2 = parseAddVaccine(text);
-    if (p2) {
-      console.log('[PARSE_RULE] add_vaccine', p2);
-      let petName = p2.pet;
-      if (!petName) {
-        const qs = await db.collection('pets').where('owner_user_id','==', userId).orderBy('name').get();
-        if (!qs.empty) petName = qs.docs[qs.docs.length-1].data().name;
+    // === 3) Action ตาม intent แล้วให้ Gemini Chat ช่วยร่างคำตอบ ===
+    if (nlu && nlu.intent) {
+      try {
+        if (nlu.intent === 'add_pet') {
+          const name = nlu.parameters?.name;
+          if (!name) throw new Error('missing_pet_name');
+          await addPet(userId, name);
+
+          const reply = await geminiChat(
+            'คุณคือผู้ช่วยเขียนคำตอบสั้นๆ ภาษาไทย สุภาพ กระชับ',
+            `ผู้ใช้เพิ่มสัตว์เลี้ยงชื่อ "${name}" สำเร็จ ให้ตอบยืนยันแบบบวก พร้อมแนะนำคำสั่งถัดไปสั้นๆ`
+          );
+          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `เพิ่มสัตว์เลี้ยง "${name}" เรียบร้อย ✅` }]);
+        }
+
+        if (nlu.intent === 'add_vaccine') {
+          const pet = nlu.parameters?.pet_name;
+          const vaccine = nlu.parameters?.vaccine_name;
+          const date = nlu.parameters?.last_shot_date;
+          const cycle = Number(nlu.parameters?.cycle_days || 365);
+          if (!vaccine || !date) throw new Error('missing_vaccine_fields');
+
+          let petName = pet;
+          if (!petName) {
+            const qs = await db.collection('pets').where('owner_user_id','==', userId).orderBy('name').get();
+            if (!qs.empty) petName = qs.docs[qs.docs.length-1].data().name;
+          }
+          if (!petName) throw new Error('no_pet');
+
+          const next = await addVaccine(userId, petName, vaccine, date, cycle);
+          const reply = await geminiChat(
+            'คุณคือผู้ช่วยเขียนคำตอบสั้นๆ ภาษาไทย สุภาพ กระชับ',
+            `ผู้ใช้บันทึกวัคซีนสำเร็จ: สัตว์ "${petName}", วัคซีน "${vaccine}", วันที่ฉีดล่าสุด "${date}", นัดถัดไป "${next}" เขียนยืนยัน + แจ้งว่ามีเตือน D-7/D-1/D0`
+          );
+          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `บันทึกวัคซีน ${vaccine} ให้ ${petName} แล้ว ✅ นัดถัดไป: ${next}` }]);
+        }
+
+        if (nlu.intent === 'list_vaccine') {
+          let petName = nlu.parameters?.pet_name;
+          if (!petName) {
+            const qs = await db.collection('pets').where('owner_user_id','==', userId).orderBy('name').get();
+            if (!qs.empty) petName = qs.docs[qs.docs.length-1].data().name;
+          }
+          if (!petName) throw new Error('no_pet');
+
+          const vSnap = await db.collection('vaccines')
+            .where('owner_user_id','==', userId)
+            .where('pet_name','==', petName)
+            .get();
+          if (vSnap.empty) {
+            const none = await geminiChat(
+              'คุณคือผู้ช่วยเขียนคำตอบสุภาพ',
+              `ยังไม่มีข้อมูลวัคซีนของ "${petName}" แนะนำผู้ใช้วิธีเพิ่มวัคซีนแบบตัวอย่าง 1 บรรทัด`
+            );
+            return lineClient.replyMessage(event.replyToken, [{ type:'text', text: none || `ยังไม่มีข้อมูลวัคซีนของ ${petName}` }]);
+          }
+          const lines = vSnap.docs.map(d => {
+            const r = d.data();
+            return `• ${r.vaccine_name}  ล่าสุด: ${r.last_shot_date||'-'}  นัด: ${r.next_due_date||'-'}`;
+          }).join('\n');
+
+          const reply = await geminiChat(
+            'คุณคือผู้ช่วยสรุปรายการเป็นภาษาไทย อ่านง่าย',
+            `สรุปรายการวัคซีนของ "${petName}" จากข้อมูลต่อไปนี้:\n${lines}\nแปลงเป็นสรุปสั้นๆ ภาษามนุษย์อ่านง่าย`
+          );
+          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `กำหนดวัคซีนของ ${petName}\n${lines}` }]);
+        }
+
+        if (nlu.intent === 'help' || nlu.intent === 'smalltalk') {
+          const reply = await geminiChat(
+            'คุณคือผู้ช่วยของบอทวัคซีนสัตว์เลี้ยง ให้คำแนะนำการใช้งาน',
+            `เขียนคำตอบสั้นๆ แนะนำคำสั่ง:
+- "เพิ่มหมาชื่อ โมจิ"
+- "วัคซีน: Rabies 2025-11-03 365"
+- "ดูวัคซีนของโมจิ"`
+          );
+          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || 'พิมพ์: เมนู เพื่อดูคำสั่งได้เลยครับ/ค่ะ' }]);
+        }
+
+      } catch (err) {
+        console.error('[NLU-ACTION ERROR]', err.message);
+        // ถ้าพังค่อยไป fallback ท้ายสุด
       }
-      if (!petName) return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'ยังไม่มีสัตว์เลี้ยง กรุณาเพิ่มก่อนครับ/ค่ะ' }]);
-      const next = await addVaccine(userId, petName, p2.vaccine, p2.date, p2.cycle);
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`บันทึกวัคซีน ${p2.vaccine} ให้ ${petName} แล้ว ✅ นัดถัดไป: ${next}` }]);
     }
 
-    const p3 = parseListVaccine(text);
-    if (p3) {
-      console.log('[PARSE_RULE] list_vaccine', p3);
-      let petName = p3.pet;
-      if (!petName) {
-        const qs = await db.collection('pets').where('owner_user_id','==', userId).orderBy('name').get();
-        if (!qs.empty) petName = qs.docs[qs.docs.length-1].data().name;
-      }
-      if (!petName) return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'ยังไม่มีสัตว์เลี้ยง กรุณาเพิ่มก่อนครับ/ค่ะ' }]);
-      const vSnap = await db.collection('vaccines').where('owner_user_id','==', userId).where('pet_name','==', petName).get();
-      if (vSnap.empty) return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`ยังไม่มีข้อมูลวัคซีนของ ${petName}` }]);
-      const lines = vSnap.docs.map(d => {
-        const r = d.data();
-        return `• ${r.vaccine_name}  ล่าสุด: ${r.last_shot_date||'-'}  นัด: ${r.next_due_date||'-'}`;
-      }).join('\n');
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`กำหนดวัคซีนของ ${petName}\n${lines}` }]);
-    }
-
-    // (เสริม) ลอง Gemini ถ้ากฎไม่จับ — ถ้าล้มจะ return null แล้วมาทาง fallback ด้านล่าง
-    const parsed = await geminiParse(text);
-    if (parsed?.intent === 'add_pet') {
-      const name = parsed.parameters?.name;
-      if (name) {
-        await addPet(userId, name);
-        return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`เพิ่มสัตว์เลี้ยง "${name}" เรียบร้อย ✅` }]);
-      }
-    } else if (parsed?.intent === 'add_vaccine') {
-      const pet = parsed.parameters?.pet_name;
-      const vaccine = parsed.parameters?.vaccine_name || parsed.parameters?.vaccine;
-      const date = normalizeDate(parsed.parameters?.last_shot_date || '');
-      const cycle = parsed.parameters?.cycle_days || 365;
-      if (pet && vaccine && date) {
-        const next = await addVaccine(userId, pet, vaccine, date, cycle);
-        return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`บันทึกวัคซีน ${vaccine} ให้ ${pet} แล้ว ✅ นัดถัดไป: ${next}` }]);
-      }
-    }
-
-    // คู่มือ/ตัวอย่าง (fallback)
+    // === 4) Fallback คู่มือสั้นๆ ===
     return lineClient.replyMessage(event.replyToken, [{
       type:'text',
       text:'ลองพิมพ์ตามนี้นะครับ/ค่ะ 🐾\n- เพิ่มหมาชื่อ โมจิ\n- วัคซีน: Rabies 2025-11-03 365\n- ฉีด Rabies ให้โมจิ 2025-11-03 รอบ 365\n- ดูวัคซีนของโมจิ'
@@ -305,7 +382,7 @@ app.post('/webhook', lineMw(lineConfig), async (req, res) => {
   res.status(200).end();
 });
 
-// ตรวจ Signature ด้วย POST เท่านั้น (เอาออกเมื่อใช้งานจริง)
+// ตรวจ Signature แบบ raw (debug เท่านั้น)
 app.post('/webhook-raw', (req, res) => {
   try {
     const sig = req.headers['x-line-signature'];
@@ -320,7 +397,7 @@ app.post('/webhook-raw', (req, res) => {
   }
 });
 
-// ✅ Debug Firestore route (เอาออกเมื่อใช้งานจริง)
+// Debug Firestore (ควรลบทิ้งเมื่อโปรดักชัน)
 app.get('/debug/firestore', async (req, res) => {
   try {
     if (!db) throw new Error('db_not_ready');
@@ -332,7 +409,7 @@ app.get('/debug/firestore', async (req, res) => {
   }
 });
 
-// ---------- CRON ----------
+// ---------- CRON: แจ้งเตือน D-7/D-1/D0 ----------
 cron.schedule('0 * * * *', async () => {
   if (!db) return;
   const now = admin.firestore.Timestamp.now();
@@ -343,7 +420,10 @@ cron.schedule('0 * * * *', async () => {
   for (const doc of due.docs) {
     const r = doc.data();
     try {
-      await lineClient.pushMessage(r.owner_user_id, { type: 'text', text: `แจ้งเตือน${r.type} 🐾 ถึงกำหนดวัคซีนของ ${r.pet_name}` });
+      await lineClient.pushMessage(r.owner_user_id, {
+        type: 'text',
+        text: `แจ้งเตือน${r.type} 🐾 ถึงกำหนดวัคซีนของ ${r.pet_name}`
+      });
       await doc.ref.update({ sent: true });
     } catch (e) { console.error('push error', e.message); }
   }
