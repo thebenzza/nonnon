@@ -1,550 +1,597 @@
-import 'dotenv/config';
+// server.js — Nonnon (น้อนน้อน) LINE Bot with Firebase + Gemini Planner (No-Keyword)
+// Node >= 18, package.json should include: "type":"module"
+// ENV required:
+// - PORT (default 8080)
+// - TZ=Asia/Bangkok
+// - LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN
+// - GEMINI_API_KEY  (from Google AI Studio)
+// - FIREBASE_SERVICE_ACCOUNT (JSON string for service account; keep newlines or escaped \n)
+// Optional:
+// - LOG_LEVEL (info|debug)
+
 import express from 'express';
-import axios from 'axios';
-import cron from 'node-cron';
-import admin from 'firebase-admin';
 import crypto from 'crypto';
-import { Client, middleware as lineMw } from '@line/bot-sdk';
-import stream from 'stream';
+import { middleware as lineMw, Client as LineClient } from '@line/bot-sdk';
+import admin from 'firebase-admin';
 
-/**
- * LINE Pet Vaccine Bot — "น้อนน้อน" (Firebase Firestore + Gemini + Railway)
- * ENV ที่ต้องมี:
- * - LINE_CHANNEL_SECRET
- * - LINE_CHANNEL_ACCESS_TOKEN
- * - GEMINI_API_KEY  (AI Studio / Generative Language API)
- * - FIREBASE_SERVICE_ACCOUNT  (JSON ทั้งก้อน; private_key มี \\n ได้)
- * - TZ=Asia/Bangkok
- * (ออปชันเก็บรูป) FIREBASE_STORAGE_BUCKET = <project-id>.appspot.com
- */
+// --- Config ---
+const cfg = {
+  port: Number(process.env.PORT || 8080),
+  tz: process.env.TZ || 'Asia/Bangkok',
+  line: {
+    channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+    channelSecret: process.env.LINE_CHANNEL_SECRET,
+  },
+  gemini: {
+    apiKey: process.env.GEMINI_API_KEY,
+    defaultModel: 'gemini-2.5-flash', // fast & capable; switch to pro when needed
+  },
+  log: process.env.LOG_LEVEL || 'info',
+};
 
-const app = express();
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; } // เก็บ raw body สำหรับตรวจลายเซ็น
-}));
+function log(...args){ if (cfg.log !== 'silent') console.log(...args); }
+function logErr(...args){ console.error(...args); }
 
-// Access log
-app.set('trust proxy', true);
-app.use((req, res, next) => {
-  const t = Date.now();
-  res.on('finish', () => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now()-t}ms)`);
+// --- Firebase Admin init ---
+let firebaseInit = false;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT is missing');
+  const json = JSON.parse(
+    raw
+      .replace(/^\uFEFF/, '') // strip BOM
+      .replace(/\n/g, '\n')   // keep escaped newlines
+  );
+  admin.initializeApp({
+    credential: admin.credential.cert(json),
+    storageBucket: json.project_id ? `${json.project_id}.appspot.com` : undefined,
   });
-  next();
+  firebaseInit = true;
+  log('Firebase initialized');
+} catch (e) {
+  logErr('[FIREBASE_INIT_ERROR]', e.message);
+}
+
+const db = firebaseInit ? admin.firestore() : null;
+
+// --- LINE client ---
+const lineClient = new LineClient({
+  channelAccessToken: cfg.line.channelAccessToken,
+  channelSecret: cfg.line.channelSecret,
 });
 
-app.get('/', (_, res) => res.send('น้อนน้อนพร้อมช่วยบันทึกวัคซีน/การรักษาน้อง ๆ แล้วครับ/ค่ะ 🐾'));
-app.get('/healthz', (_, res) => res.json({ ok: true, ts: Date.now() }));
-app.get('/version', (_, res) => res.json({ version: 'noonnon-2.0.0', time: new Date().toISOString() }));
+// --- Express ---
+const app = express();
+app.set('trust proxy', true);
 
-// ---------- FIREBASE ----------
-let db, bucket = null;
-(function initFirebaseSafe() {
+// Minimal health
+app.get('/', (_req, res) => res.send('Nonnon Pet Bot OK'));
+
+// Debug Firestore
+app.get('/debug/firestore', async (_req, res) => {
   try {
-    const svc = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    if (svc.private_key && svc.private_key.includes('\\n') === false && svc.private_key.includes('\\\\n')) {
-      svc.private_key = svc.private_key.replace(/\\\\n/g, '\n');
-    }
-    const opts = { credential: admin.credential.cert(svc) };
-    if (process.env.FIREBASE_STORAGE_BUCKET) {
-      opts.storageBucket = process.env.FIREBASE_STORAGE_BUCKET;
-    }
-    admin.initializeApp(opts);
-    db = admin.firestore();
-    if (process.env.FIREBASE_STORAGE_BUCKET) bucket = admin.storage().bucket();
-    console.log('Firebase initialized', bucket ? '(+Storage)' : '');
+    if (!db) return res.status(500).json({ ok:false, error:'NO_DB' });
+    const doc = await db.collection('debug').add({ at: admin.firestore.Timestamp.now() });
+    return res.json({ ok:true, id: doc.id });
   } catch (e) {
-    console.error('[FIREBASE_INIT_ERROR]', e.message);
+    return res.status(500).json({ ok:false, error: e.message });
   }
-})();
+});
 
-// ---------- LINE ----------
-const lineConfig = {
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-};
-const lineClient = new Client(lineConfig);
-
-// ---------- GEMINI ----------
-async function geminiCall(model, contents, genCfg = {}) {
-  if (!process.env.GEMINI_API_KEY) return null;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-  const body = { contents, generationConfig: { temperature: 0.2, ...genCfg } };
-  try {
-    const { data } = await axios.post(url, body, { timeout: 15000 });
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    return text;
-  } catch (e) {
-    if (e.response) console.error('Gemini error:', e.response.status, e.response.data);
-    else console.error('Gemini error:', e.message);
-    return null;
-  }
-}
-
-// NLU: ขยาย intents สำหรับสัตว์/วัคซีน/การรักษา/รูป
-async function geminiNLU(userText) {
-  const sys = `คุณคือ NLU สำหรับ "น้อนน้อน" ผู้ช่วยจดข้อมูลสัตว์เลี้ยง ให้ตอบเป็น JSON "เท่านั้น"
-รูปแบบ:
-{"intent":"add_pet|add_pet_details|add_vaccine|list_vaccine|add_treatment|list_treatments|help|smalltalk","parameters":{...}}
-กติกา:
-- add_pet: {"name":"<ชื่อ>"}  (ถ้าเจอประเภท/เพศ/พันธุ์/วันเกิด ก็ใส่ใน fields เดียวกับ add_pet_details ได้)
-- add_pet_details: {"name":"<ชื่อ>","species":"dog|cat|other","breed":"<พันธุ์>","sex":"male|female|unknown","birthdate":"YYYY-MM-DD","photo_url":"<url|optional>"}
-- add_vaccine: {"pet_name":"<ชื่อ>","vaccine_name":"<ชื่อวัคซีน>","last_shot_date":"YYYY-MM-DD","cycle_days":<วัน>}
-- list_vaccine: {"pet_name":"<อาจว่างได้>"}
-- add_treatment: {"pet_name":"<ชื่อ>","diagnosis":"<โรค>","hospital":"<โรงพยาบาล>","date":"YYYY-MM-DD","note":"<ข้อความ|optional>"}
-- list_treatments: {"pet_name":"<อาจว่างได้>"}
-- help/smalltalk: {}
-ห้ามตอบอย่างอื่น นอกจาก JSON เดียว ไม่มีโค้ดบล็อก ไม่มีคำอธิบาย`;
-  const text = await geminiCall(
-    'gemini-2.5-flash',
-    [
-      { role: 'user', parts: [{ text: sys }] },
-      { role: 'user', parts: [{ text: userText }] }
-    ],
-    { temperature: 0.1 }
-  );
-  if (!text) return null;
-  const cleaned = text.replace(/```json|```/g, '').trim();
-  try { return JSON.parse(cleaned); } catch { return null; }
-}
-
-// Chat: ให้ช่วยเขียนคำตอบไทยสั้นๆ
-async function geminiChat(systemHint, userHint) {
-  const text = await geminiCall(
-    'gemini-2.5-flash',
-    [
-      { role: 'user', parts: [{ text: systemHint }] },
-      { role: 'user', parts: [{ text: userHint }] }
-    ],
-    { temperature: 0.4 }
-  );
-  return text || null;
-}
-
-// ---------- Utils & Parsers ----------
-function normalizeDate(input) {
-  if (!input) return '';
-  const s = input.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if (m) {
-    const d = String(m[1]).padStart(2,'0');
-    const mm = String(m[2]).padStart(2,'0');
-    const y = m[3];
-    return `${y}-${mm}-${d}`;
-  }
-  return '';
-}
-function addDays(dateStr, days) {
-  const d = new Date(dateStr + 'T00:00:00+07:00');
-  d.setDate(d.getDate() + Number(days));
-  return d.toISOString().slice(0,10);
-}
-
-// ---------- Firestore helpers ----------
-async function ensureOwner(line_user_id, name='') {
-  try {
-    const ref = db.collection('owners').doc(line_user_id);
-    const snap = await ref.get();
-    if (!snap.exists) await ref.set({ display_name: name, consent_pdpa_at: admin.firestore.Timestamp.now() });
-    return true;
-  } catch (err) {
-    console.error('[ensureOwner ERROR]', err.message);
-    return false;
-  }
-}
-
-async function addOrUpdatePet(userId, payload) {
-  // payload: { name, species, breed, sex, birthdate, photo_url }
-  if (!payload?.name) throw new Error('missing_pet_name');
-  const q = await db.collection('pets')
-    .where('owner_user_id','==', userId)
-    .where('name','==', payload.name)
-    .limit(1).get();
-  const base = {
-    owner_user_id: userId,
-    name: payload.name,
-    species: payload.species || null,
-    breed: payload.breed || null,
-    sex: payload.sex || 'unknown',
-    birthdate: payload.birthdate || null,
-    photo_url: payload.photo_url || null,
-    updated_at: admin.firestore.Timestamp.now()
-  };
-  if (q.empty) {
-    await db.collection('pets').add({ ...base, created_at: admin.firestore.Timestamp.now() });
-  } else {
-    await q.docs[0].ref.set(base, { merge: true });
-  }
-}
-
-async function addVaccine(userId, pet_name, vaccine_name, last_shot_date, cycle_days=365) {
-  const nextDue = addDays(last_shot_date, cycle_days);
-  const vRef = await db.collection('vaccines').add({
-    owner_user_id: userId, pet_name, vaccine_name, last_shot_date, next_due_date: nextDue,
-    created_at: admin.firestore.Timestamp.now()
-  });
-  const reminders = db.collection('reminders');
-  const d0 = new Date(nextDue + 'T09:00:00+07:00');
-  const d1 = new Date(d0.getTime() - 24*60*60*1000);
-  const d7 = new Date(d0.getTime() - 7*24*60*60*1000);
-  for (const [t, dt] of [['D0', d0], ['D-1', d1], ['D-7', d7]]) {
-    await reminders.add({
-      owner_user_id: userId,
-      vaccine_id: vRef.id,
-      pet_name,
-      type: t,
-      remind_at: admin.firestore.Timestamp.fromDate(dt),
-      sent: false
-    });
-  }
-  return nextDue;
-}
-
-async function addTreatment(userId, payload) {
-  // { pet_name, diagnosis, hospital, date, note }
-  if (!payload?.pet_name) throw new Error('missing_pet_name');
-  const date = payload.date ? normalizeDate(payload.date) : null;
-  await db.collection('treatments').add({
-    owner_user_id: userId,
-    pet_name: payload.pet_name,
-    diagnosis: payload.diagnosis || null,
-    hospital: payload.hospital || null,
-    date,
-    note: payload.note || null,
-    created_at: admin.firestore.Timestamp.now()
-  });
-}
-
-// เลือกสัตว์ตัวล่าสุด (ถ้าไม่ได้ระบุ)
-async function getLastPetName(userId) {
-  const qs = await db.collection('pets').where('owner_user_id','==', userId).orderBy('name').get();
-  if (qs.empty) return null;
-  return qs.docs[qs.docs.length - 1].data().name || null;
-}
-
-// ---------- Sessions (สำหรับรอรูป/ถามต่อ) ----------
-async function setSession(userId, data) {
-  await db.collection('sessions').doc(userId).set({ ...data, updated_at: admin.firestore.Timestamp.now() }, { merge: true });
-}
-async function getSession(userId) {
-  const snap = await db.collection('sessions').doc(userId).get();
-  return snap.exists ? snap.data() : null;
-}
-async function clearSession(userId) {
-  await db.collection('sessions').doc(userId).delete().catch(()=>{});
-}
-
-// ---------- LINE Handlers ----------
-async function handleEvent(event) {
-  const userId = event.source?.userId;
-  if (!userId) return;
-
-  // ต้อนรับแบบ "น้อนน้อน"
-  if (event.type === 'follow') {
-    try {
-      const profile = await lineClient.getProfile(userId);
-      await ensureOwner(userId, profile.displayName);
-      const msg = `สวัสดีคุณ${profile.displayName} 🐾\nหนูชื่อ “น้อนน้อน” ผู้ช่วยจดข้อมูลสัตว์เลี้ยงค่ะ/ครับ\nพร้อมช่วยบันทึกประวัติ, วัคซีน, และการรักษาให้น้อง ๆ เสมอ!\n\nเริ่มได้เลย เช่น:\n• เพิ่มหมาชื่อ โมจิ เพศผู้ เกิด 2023-04-01 พันธุ์ปอม\n• วัคซีน: Rabies 2025-11-03 365\n• บันทึกการรักษา โมจิ โรคผิวหนัง รพ.สัตว์บางรัก 2025-11-01`;
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text: msg }]);
-    } catch (e) {
-      console.error('follow error', e.message);
-      return;
-    }
-  }
-
-  // รูปภาพ: ใช้กับ workflow อัปโหลดรูปสัตว์
-  if (event.type === 'message' && event.message.type === 'image') {
-    const sess = await getSession(userId);
-    if (!sess || sess.expect !== 'pet_photo') {
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'รับรูปแล้วครับ/ค่ะ หากต้องการตั้งเป็นรูปประจำตัวน้อง ให้พิมพ์: เพิ่มรูปให้{ชื่อน้อง} แล้วส่งรูปอีกครั้ง' }]);
-    }
-    try {
-      const contentStream = await lineClient.getMessageContent(event.message.id);
-      const chunks = [];
-      await new Promise((resolve, reject) => {
-        contentStream.on('data', (c) => chunks.push(c));
-        contentStream.on('end', resolve);
-        contentStream.on('error', reject);
-      });
-      const buf = Buffer.concat(chunks);
-
-      let photoURL = null;
-      if (bucket) {
-        const filename = `pets/${userId}/${sess.pet_name}_${Date.now()}.jpg`;
-        const file = bucket.file(filename);
-        await file.save(buf, { contentType: 'image/jpeg', resumable: false, public: true });
-        await file.makePublic().catch(()=>{});
-        photoURL = `https://storage.googleapis.com/${bucket.name}/${filename}`;
-      }
-
-      // อัปเดตรูปให้สัตว์ตัวนั้น
-      await addOrUpdatePet(userId, { name: sess.pet_name, photo_url: photoURL || '(stored-local)' });
-      await clearSession(userId);
-
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text: `บันทึกรูปของ "${sess.pet_name}" เรียบร้อยแล้ว ✅` }]);
-    } catch (e) {
-      console.error('image save error', e.message);
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'ขอโทษด้วย บันทึกรูปไม่สำเร็จ ลองใหม่อีกครั้งได้ครับ/ค่ะ' }]);
-    }
-  }
-
-  if (event.type === 'message' && event.message.type === 'text') {
-    const text = (event.message.text || '').trim();
-    await ensureOwner(userId);
-
-    // เมนู/ช่วยเหลือด่วน
-    if (/^เมนู$|^ช่วยเหลือ$/i.test(text)) {
-      const t = `เมนูของน้อนน้อน 🐾\n• เพิ่มสัตว์เลี้ยง: "เพิ่มแมวชื่อ ชูครีม เพศเมีย พันธุ์สก็อตติช เกิด 2024-02-10"\n• เพิ่มรูปสัตว์: "เพิ่มรูปให้ชูครีม" แล้วส่งรูป\n• บันทึกวัคซีน: "วัคซีน: Rabies 2025-11-03 365"\n• ดูวัคซีน: "ดูวัคซีนของชูครีม"\n• บันทึกการรักษา: "บันทึกการรักษา ชูครีม โรคผิวหนัง รพ.สัตว์A 2025-10-01 หมายเหตุ: ให้ยาทา"\n• ดูประวัติรักษา: "ดูการรักษาของชูครีม"\n• ลบข้อมูล ทั้งหมด: "ลบข้อมูล"`;
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text: t }]);
-    }
-
-    // ลบข้อมูลทั้งหมด (PDPA)
-    if (/^ลบข้อมูล$/i.test(text)) {
-      try {
-        const ownerId = userId;
-        const delCol = async (col) => {
-          const snap = await db.collection(col).where('owner_user_id','==', ownerId).get();
-          const batch = db.batch();
-          snap.forEach(d => batch.delete(d.ref));
-          await batch.commit();
-        };
-        await Promise.all([delCol('reminders'), delCol('vaccines'), delCol('pets'), delCol('treatments')]);
-        await db.collection('owners').doc(ownerId).delete().catch(()=>{});
-        await clearSession(userId);
-        return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'ลบข้อมูลทั้งหมดของคุณเรียบร้อยแล้ว ✅' }]);
-      } catch (e) {
-        console.error('delete all error', e.message);
-        return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'ลบข้อมูลไม่สำเร็จ กรุณาลองใหม่ครับ/ค่ะ' }]);
-      }
-    }
-
-    // คำสั่งเพิ่มรูป: "เพิ่มรูปให้โมจิ"
-    const addPhotoCmd = text.match(/^เพิ่มรูปให้(.+)$/i);
-    if (addPhotoCmd) {
-      const petName = addPhotoCmd[1].trim();
-      await setSession(userId, { expect: 'pet_photo', pet_name: petName });
-      return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`โอเค ส่งรูปของ "${petName}" มาได้เลยครับ/ค่ะ` }]);
-    }
-
-    // === NLU นำ ===
-    let nlu = await geminiNLU(text);
-
-    // ถ้า NLU ไม่ชัด ลอง rule-based เบื้องต้น
-    if (!nlu) {
-      // ตัวอย่างง่าย: วัคซีน: Rabies 2025-11-03 365
-      const vx = text.match(/^วัคซีน\s*:\s*([^\s]+)\s+([^\s]+)\s+(\d{2,4})$/i);
-      if (vx) {
-        nlu = { intent: 'add_vaccine', parameters: {
-          pet_name: null, vaccine_name: vx[1], last_shot_date: normalizeDate(vx[2]), cycle_days: parseInt(vx[3],10)||365
-        }};
-      }
-      // “ดูวัคซีนของโมจิ”
-      if (!nlu && /^ดู(กำหนด)?วัคซีน(?:ของ(.+))?$/i.test(text)) {
-        const m = text.match(/^ดู(?:กำหนด)?วัคซีน(?:ของ(.+))?$/i);
-        nlu = { intent: 'list_vaccine', parameters: { pet_name: (m && m[1]) ? m[1].trim() : null } };
-      }
-      // “บันทึกการรักษา ชื่อ โรค โรงพยาบาล วันที่ … หมายเหตุ: …”
-      if (!nlu && /^บันทึกการรักษา\s+(.+)$/i.test(text)) {
-        // โครงสร้างแบบหลวม ๆ: บันทึกการรักษา {ชื่อ} {โรค} {รพ.} {YYYY-MM-DD} [หมายเหตุ: ...]
-        const raw = text.replace(/^บันทึกการรักษา\s+/i,'').trim();
-        const noteMatch = raw.match(/หมายเหตุ\s*:\s*(.+)$/i);
-        const note = noteMatch ? noteMatch[1].trim() : null;
-        const main = raw.replace(/หมายเหตุ\s*:.+$/i,'').trim().split(/\s+/);
-        if (main.length >= 4) {
-          nlu = { intent: 'add_treatment', parameters: {
-            pet_name: main[0], diagnosis: main[1], hospital: main[2], date: normalizeDate(main[3]), note
-          }};
-        }
-      }
-    }
-
-    // จัดการตาม intent
-    if (nlu && nlu.intent) {
-      try {
-        // เพิ่มสัตว์แบบเบื้องต้น (แนะถามต่อให้ครบ)
-        if (nlu.intent === 'add_pet') {
-          const name = nlu.parameters?.name;
-          if (!name) throw new Error('missing_pet_name');
-          await addOrUpdatePet(userId, { name, sex: 'unknown' });
-
-          const reply = await geminiChat(
-            'คุณคือน้อนน้อน พูดสุภาพ เป็นกันเอง',
-            `ผู้ใช้เพิ่มสัตว์เลี้ยงชื่อ "${name}" แล้ว แต่ยังไม่ครบ ให้คุณชวนถามต่อว่าเป็นสัตว์อะไร (สุนัข/แมว/อื่นๆ), เพศอะไร, พันธุ์อะไร, วันเกิดเมื่อไหร่ และแนะนำ "ส่งรูป" ได้ด้วย`
-          );
-          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `เพิ่ม "${name}" แล้วครับ/ค่ะ — บอกน้อนน้อนเพิ่มได้ว่าพันธุ์/เพศ/วันเกิด และสามารถ "เพิ่มรูปให้${name}" ได้ด้วยนะ` }]);
-        }
-
-        // เพิ่ม/อัปเดตรายละเอียดสัตว์ (ครบหรือบางส่วน)
-        if (nlu.intent === 'add_pet_details') {
-          const p = nlu.parameters || {};
-          if (!p.name) throw new Error('missing_pet_name');
-          // ปกติถ้าให้มาไม่ครบ เราก็บันทึกเท่าที่ได้
-          await addOrUpdatePet(userId, {
-            name: p.name,
-            species: p.species || null,
-            breed: p.breed || null,
-            sex: p.sex || 'unknown',
-            birthdate: p.birthdate ? normalizeDate(p.birthdate) : null,
-            photo_url: p.photo_url || null
-          });
-          const missing = [];
-          if (!p.species) missing.push('ประเภทสัตว์');
-          if (!p.sex) missing.push('เพศ');
-          if (!p.breed) missing.push('พันธุ์');
-          if (!p.birthdate) missing.push('วันเกิด');
-          const hint = missing.length ? `ยังขาด: ${missing.join(', ')} (ใส่เพิ่มได้ทีหลัง)` : 'ครบถ้วนแล้ว';
-          const reply = await geminiChat(
-            'คุณคือน้อนน้อน พูดสุภาพ สั้น กระชับ',
-            `บันทึกข้อมูลสัตว์สำเร็จ: ชื่อ "${p.name}". แจ้งสถานะ "${hint}". ถ้ายังไม่มีรูป แนะนำ "เพิ่มรูปให้${p.name}" แล้วให้ส่งรูปเข้ามา`
-          );
-          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `อัปเดตข้อมูล "${p.name}" เรียบร้อย ✅ ${hint}` }]);
-        }
-
-        // วัคซีน
-        if (nlu.intent === 'add_vaccine') {
-          const pet = nlu.parameters?.pet_name || await getLastPetName(userId);
-          const vaccine = nlu.parameters?.vaccine_name;
-          const date = normalizeDate(nlu.parameters?.last_shot_date || '');
-          const cycle = Number(nlu.parameters?.cycle_days || 365);
-          if (!pet) throw new Error('no_pet');
-          if (!vaccine || !date) throw new Error('missing_vaccine_fields');
-
-          const next = await addVaccine(userId, pet, vaccine, date, cycle);
-          const reply = await geminiChat(
-            'คุณคือน้อนน้อน ผู้ช่วยจดวัคซีน',
-            `บันทึกวัคซีนให้ "${pet}": ${vaccine}, ล่าสุด ${date}, นัดถัดไป ${next}. แจ้งผู้ใช้ว่าจะเตือน D-7/D-1/วันนัด`
-          );
-          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `บันทึกวัคซีน ${vaccine} ให้ ${pet} แล้ว ✅ นัดถัดไป: ${next} (น้อนน้อนจะเตือนล่วงหน้าให้นะ)` }]);
-        }
-
-        if (nlu.intent === 'list_vaccine') {
-          let pet = nlu.parameters?.pet_name || await getLastPetName(userId);
-          if (!pet) throw new Error('no_pet');
-          const vSnap = await db.collection('vaccines').where('owner_user_id','==', userId).where('pet_name','==', pet).get();
-          if (vSnap.empty) return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`ยังไม่มีข้อมูลวัคซีนของ ${pet}` }]);
-          const lines = vSnap.docs.map(d => {
-            const r = d.data();
-            return `• ${r.vaccine_name}  ล่าสุด: ${r.last_shot_date||'-'}  นัด: ${r.next_due_date||'-'}`;
-          }).join('\n');
-          const reply = await geminiChat('คุณคือน้อนน้อน ช่วยสรุปไทยอ่านง่าย', `สรุปวัคซีนของ "${pet}":\n${lines}`);
-          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `วัคซีนของ ${pet}\n${lines}` }]);
-        }
-
-        // การรักษา
-        if (nlu.intent === 'add_treatment') {
-          const p = nlu.parameters || {};
-          const pet = p.pet_name || await getLastPetName(userId);
-          if (!pet) throw new Error('no_pet');
-          await addTreatment(userId, {
-            pet_name: pet,
-            diagnosis: p.diagnosis || null,
-            hospital: p.hospital || null,
-            date: p.date ? normalizeDate(p.date) : null,
-            note: p.note || null
-          });
-          const reply = await geminiChat(
-            'คุณคือน้อนน้อน ผู้ช่วยจดประวัติรักษา',
-            `บันทึกการรักษาของ "${pet}" แล้ว รายละเอียด: โรค=${p.diagnosis||'-'}, โรงพยาบาล=${p.hospital||'-'}, วันที่=${p.date||'-'}. ให้พูดสุภาพและชวนให้กรอกข้อมูลเพิ่มเติมได้ภายหลัง`
-          );
-          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `บันทึกการรักษาของ ${pet} แล้ว ✅` }]);
-        }
-
-        if (nlu.intent === 'list_treatments') {
-          let pet = nlu.parameters?.pet_name || await getLastPetName(userId);
-          if (!pet) throw new Error('no_pet');
-          const tSnap = await db.collection('treatments').where('owner_user_id','==', userId).where('pet_name','==', pet).orderBy('created_at','desc').limit(10).get();
-          if (tSnap.empty) return lineClient.replyMessage(event.replyToken, [{ type:'text', text:`ยังไม่มีประวัติการรักษาของ ${pet}` }]);
-          const lines = tSnap.docs.map(d => {
-            const r = d.data();
-            return `• ${r.date||'-'}: ${r.diagnosis||'-'} @${r.hospital||'-'} ${r.note?'- '+r.note:''}`;
-          }).join('\n');
-          const reply = await geminiChat('คุณคือน้อนน้อน ช่วยสรุปไทยอ่านง่าย', `สรุปการรักษาของ "${pet}":\n${lines}`);
-          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || `ประวัติรักษาของ ${pet}\n${lines}` }]);
-        }
-
-        if (nlu.intent === 'help' || nlu.intent === 'smalltalk') {
-          const reply = await geminiChat(
-            'คุณคือน้อนน้อน แนะนำการใช้งานสั้นๆ',
-            `สอนผู้ใช้ด้วยตัวอย่าง: 
-- เพิ่มแมวชื่อ ชูครีม เพศเมีย พันธุ์สก็อตติช เกิด 2024-02-10
-- เพิ่มรูปให้ชูครีม (แล้วส่งรูป)
-- วัคซีน: Rabies 2025-11-03 365
-- บันทึกการรักษา ชูครีม โรคผิวหนัง รพ.สัตว์A 2025-10-01 หมายเหตุ: ให้ยาทา`
-          );
-          return lineClient.replyMessage(event.replyToken, [{ type:'text', text: reply || 'พิมพ์ "เมนู" เพื่อดูคำสั่งตัวอย่างได้เลยครับ/ค่ะ' }]);
-        }
-
-      } catch (err) {
-        console.error('[INTENT ERROR]', err.message);
-        // ไป fallback ด้านล่าง
-      }
-    }
-
-    // Fallback
-    const fb = `น้อนน้อนแนะนำตัวอย่างนะคะ/ครับ 🐾
-• เพิ่มแมวชื่อ ชูครีม เพศเมีย พันธุ์สก็อตติช เกิด 2024-02-10
-• เพิ่มรูปให้ชูครีม  (แล้วส่งรูปมา)
-• วัคซีน: Rabies 2025-11-03 365
-• ดูวัคซีนของชูครีม
-• บันทึกการรักษา ชูครีม โรคผิวหนัง รพ.สัตว์A 2025-10-01 หมายเหตุ: ให้ยาทา`;
-    return lineClient.replyMessage(event.replyToken, [{ type:'text', text: fb }]);
-  }
-}
-
-// ---------- Routes ----------
-app.post('/webhook', lineMw(lineConfig), async (req, res) => {
+// --- LINE Webhook (recommended) ---
+// Use official middleware to validate signature + parse JSON
+app.post('/webhook', lineMw(cfg.line), async (req, res) => {
   const events = req.body.events || [];
   await Promise.all(events.map(handleEvent));
   res.status(200).end();
 });
 
-// ตรวจลายเซ็น (debug)
-app.post('/webhook-raw', (req, res) => {
+// --- Optional: Raw webhook for manual signature testing ---
+app.use('/webhook-raw', express.raw({ type: '*/*' }));
+app.post('/webhook-raw', async (req, res) => {
   try {
-    const sig = req.headers['x-line-signature'];
-    const computed = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
-      .update(req.rawBody)
-      .digest('base64');
-    console.log('[SIGCHECK]', sig === computed ? '✅ match' : '❌ mismatch', sig, computed);
-    res.status(200).send('ok');
+    const signature = req.get('x-line-signature');
+    const hmac = crypto.createHmac('sha256', cfg.line.channelSecret);
+    hmac.update(req.body);
+    const digest = hmac.digest('base64');
+    if (digest !== signature) throw new Error('Signature mismatch');
+
+    const body = JSON.parse(req.body.toString('utf8'));
+    const events = body.events || [];
+    await Promise.all(events.map(handleEvent));
+    return res.status(200).end();
   } catch (e) {
-    console.error('[SIGCHECK_ERROR]', e.message);
-    res.status(500).send('error');
+    logErr('[SIGCHECK_ERROR]', e);
+    return res.status(500).json({ ok:false, error: e.message });
   }
 });
 
-// Debug Firestore
-app.get('/debug/firestore', async (req, res) => {
-  try {
-    const doc = await db.collection('ping').add({ ts: Date.now() });
-    res.status(200).json({ ok: true, id: doc.id });
-  } catch (e) {
-    console.error('[DEBUG_FIRESTORE]', e.message);
-    res.status(500).json({ ok: false, error: e.message });
+// --- Utilities ---
+function todayYMD(){
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth()+1).padStart(2,'0');
+  const d = String(now.getDate()).padStart(2,'0');
+  return `${y}-${m}-${d}`;
+}
+function addDays(dateStr, days){
+  const dt = new Date(`${dateStr}T00:00:00+07:00`);
+  dt.setDate(dt.getDate() + Number(days || 0));
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth()+1).padStart(2,'0');
+  const d = String(dt.getDate()).padStart(2,'0');
+  return `${y}-${m}-${d}`;
+}
+function normalizeDate(s){
+  if (!s) return null;
+  // allow DD/MM/YYYY
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)){
+    const [d,m,y] = s.split('/');
+    return `${y}-${m}-${d}`;
   }
-});
+  // allow YYYY.MM.DD or YYYY/MM/DD
+  return s.replace(/\./g,'-').replace(/\//g,'-');
+}
 
-// ---------- CRON: แจ้งเตือนวัคซีน ----------
-cron.schedule('0 * * * *', async () => {
-  if (!db) return;
-  const now = admin.firestore.Timestamp.now();
-  const due = await db.collection('reminders')
-    .where('sent', '==', false)
-    .where('remind_at', '<=', now)
-    .get();
-  for (const doc of due.docs) {
-    const r = doc.data();
-    try {
-      await lineClient.pushMessage(r.owner_user_id, {
-        type: 'text',
-        text: `แจ้งเตือน${r.type} 🐾 ถึงกำหนดวัคซีนของ ${r.pet_name}`
-      });
-      await doc.ref.update({ sent: true });
-    } catch (e) { console.error('push error', e.message); }
+async function ensureOwner(userId, displayName){
+  const ref = db.collection('owners');
+  const snap = await ref.where('line_user_id','==', userId).limit(1).get();
+  if (snap.empty){
+    await ref.add({
+      line_user_id: userId,
+      display_name: displayName || null,
+      consent_pdpa_at: admin.firestore.Timestamp.now(),
+      created_at: admin.firestore.Timestamp.now(),
+    });
   }
-}, { timezone: process.env.TZ || 'Asia/Bangkok' });
+}
 
-// ---------- START ----------
-const port = process.env.PORT || 3000;
-app.listen(port, '0.0.0.0', () => console.log('Server running on', port));
+async function getLastPetName(userId){
+  const q = await db.collection('pets')
+    .where('owner_user_id','==', userId)
+    .orderBy('updated_at','desc')
+    .limit(1).get();
+  if (q.empty) return null;
+  return q.docs[0].data().name;
+}
+
+async function setSession(userId, obj){
+  await db.collection('sessions').doc(userId).set({ ...obj, updated_at: admin.firestore.Timestamp.now() }, { merge: true });
+}
+async function getSession(userId){
+  const d = await db.collection('sessions').doc(userId).get();
+  return d.exists ? d.data() : null;
+}
+
+// --- Firestore helpers (schema expanded) ---
+async function upsertPetProfile(userId, p){
+  if (!p?.pet_name && !p?.name) throw new Error('missing_pet_name');
+  const name = p.pet_name || p.name;
+  const ref = db.collection('pets');
+  const q = await ref.where('owner_user_id','==', userId).where('name','==', name).limit(1).get();
+  const doc = {
+    owner_user_id: userId,
+    name,
+    species: p.species || null,
+    breed: p.breed || null,
+    sex: p.sex || 'unknown',
+    birthdate: p.birthdate || null,
+    neutered: typeof p.neutered === 'boolean' ? p.neutered : null,
+    color_markings: p.color_markings || null,
+    microchip_id: p.microchip_id || null,
+    license_tag: p.license_tag || null,
+    adoption_date: p.adoption_date || null,
+    profile_photo_url: p.photo_url || p.profile_photo_url || null,
+    updated_at: admin.firestore.Timestamp.now()
+  };
+  if (q.empty){
+    await ref.add({ ...doc, created_at: admin.firestore.Timestamp.now() });
+  } else {
+    await q.docs[0].ref.set(doc, { merge: true });
+  }
+}
+
+async function addVaccine(userId, petName, vaccineName, lastDate, cycleDays){
+  const next = addDays(lastDate, Number(cycleDays || 365));
+  await db.collection('vaccines').add({
+    owner_user_id: userId,
+    pet_name: petName,
+    vaccine_name: vaccineName,
+    last_shot_date: lastDate,
+    next_due_date: next,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+  // create reminders D-7, D-1, D0 (09:00)
+  const toIsoAt = (ymd, hhmm='09:00') => new Date(`${ymd}T${hhmm}:00+07:00`).toISOString();
+  const d0 = toIsoAt(next);
+  const d1 = new Date(new Date(d0).getTime() - 24*60*60*1000).toISOString();
+  const d7 = new Date(new Date(d0).getTime() - 7*24*60*60*1000).toISOString();
+  const addReminder = (type, at) => db.collection('reminders').add({
+    owner_user_id: userId,
+    pet_name: petName,
+    type, remind_at: at, sent: false,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+  await Promise.all([
+    addReminder('D-7', d7),
+    addReminder('D-1', d1),
+    addReminder('D0', d0),
+  ]);
+  return next;
+}
+
+async function addParasite(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.type || !p.product_name || !p.given_date) throw new Error('missing_parasite_fields');
+  const next = p.next_due_date || (p.cycle_days ? addDays(p.given_date, Number(p.cycle_days)) : null);
+  await db.collection('parasite_prevention').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    type: p.type,
+    product_name: p.product_name,
+    given_date: p.given_date,
+    next_due_date: next,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+  return next;
+}
+
+async function addAllergy(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.type || !p.name) throw new Error('missing_allergy_fields');
+  await db.collection('allergies').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    type: p.type,
+    name: p.name,
+    severity: p.severity || null,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addVet(userId, p){
+  if (!p.clinic_name && !p.doctor_name) throw new Error('missing_vet_fields');
+  await db.collection('vets').add({
+    owner_user_id: userId,
+    clinic_name: p.clinic_name || null,
+    doctor_name: p.doctor_name || null,
+    phone: p.phone || null,
+    address: p.address || null,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addMedicalHistory(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.title || !p.date) throw new Error('missing_medhist_fields');
+  await db.collection('medical_history').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    title: p.title,
+    date: p.date,
+    hospital: p.hospital || null,
+    details: p.details || null,
+    attachments: p.attachments || [],
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addMedication(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.drug_name) throw new Error('missing_medication_fields');
+  await db.collection('medications').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    drug_name: p.drug_name,
+    dosage: p.dosage || null,
+    frequency: p.frequency || null,
+    start_date: p.start_date || null,
+    end_date: p.end_date || null,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addWeight(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.date || typeof p.weight_kg !== 'number') throw new Error('missing_weight_fields');
+  await db.collection('weights').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    date: p.date,
+    weight_kg: p.weight_kg,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function setFeeding(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet) throw new Error('missing_pet_name');
+  await db.collection('feeding_schedules').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    brand: p.brand || null,
+    type: p.type || null,
+    amount: p.amount || null,
+    times: p.times || [],
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addExercise(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.date) throw new Error('missing_exercise_fields');
+  await db.collection('exercise_logs').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    date: p.date,
+    duration_min: Number(p.duration_min || 0),
+    distance_km: p.distance_km != null ? Number(p.distance_km) : null,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function setGrooming(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.type) throw new Error('missing_grooming_fields');
+  await db.collection('grooming_schedules').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    type: p.type,
+    last_date: p.last_date || null,
+    next_due_date: p.next_due_date || null,
+    vendor: p.vendor || null,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addDiary(userId, p){
+  const pet = p.pet_name || await getLastPetName(userId);
+  if (!pet || !p.date || !p.note) throw new Error('missing_diary_fields');
+  await db.collection('behavior_diary').add({
+    owner_user_id: userId,
+    pet_name: pet,
+    date: p.date,
+    note: p.note,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addDocument(userId, p){
+  if (!p.doc_type || !p.file_url) throw new Error('missing_document_fields');
+  await db.collection('documents').add({
+    owner_user_id: userId,
+    pet_name: p.pet_name || null,
+    doc_type: p.doc_type,
+    title: p.title || null,
+    file_url: p.file_url,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+async function addContact(userId, p){
+  if (!p.type || !p.name || !p.phone) throw new Error('missing_contact_fields');
+  await db.collection('owner_contacts').add({
+    owner_user_id: userId,
+    type: p.type,
+    name: p.name,
+    phone: p.phone,
+    relation: p.relation || null,
+    address: p.address || null,
+    note: p.note || null,
+    created_at: admin.firestore.Timestamp.now(),
+  });
+}
+
+// --- Gemini Calls ---
+async function geminiCall(model, messages, genConfig={}){
+  // messages: [{role:'user'|'model'|'system', parts:[{text:string}]}]
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${cfg.gemini.apiKey}`;
+  const body = {
+    contents: messages.map(m => ({ role: m.role === 'system' ? 'user' : m.role, parts: m.parts })),
+    safetySettings: [],
+    generationConfig: {
+      temperature: genConfig.temperature ?? 0.2,
+      topP: genConfig.topP ?? 0.95,
+      topK: genConfig.topK ?? 64,
+      maxOutputTokens: genConfig.maxOutputTokens ?? 1024,
+    }
+  };
+  const res = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok){
+    const txt = await res.text().catch(()=> '');
+    throw new Error(`Gemini HTTP ${res.status}: ${txt}`);
+  }
+  const data = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+  return text.trim();
+}
+
+async function geminiChat(systemText, userText, model = cfg.gemini.defaultModel){
+  try{
+    const out = await geminiCall(model, [
+      { role: 'user', parts: [{ text: `SYSTEM:\n${systemText}` }]},
+      { role: 'user', parts: [{ text: userText }]} 
+    ]);
+    return out;
+  }catch(e){ logErr('Gemini parse error:', e.message); return null; }
+}
+
+async function geminiPlanner(userText, context={}){
+  const sys = `คุณคือ \"น้อนน้อน Planner\" วางแผนการทำงานสำหรับบอทสัตว์เลี้ยง\n- ตอบเป็น JSON เดียวเท่านั้น (ไม่มี code block/คำบรรยาย)\n- ถ้าข้อมูลไม่พอให้ถามต่อใน \"followup_question\"\n- ถ้ามั่นใจ < 0.6 ให้ถามยืนยันก่อนลงมือ\n- ใช้ actions จากชุดนี้เท่านั้น: add_pet, upsert_pet, add_vaccine, list_vaccine, add_parasite_prevention, list_parasite_prevention, add_allergy, list_allergies, add_vet, list_vets, add_medical_history, list_medical_history, add_medication, list_medications, add_weight, list_weights, set_feeding, list_feeding, add_exercise, list_exercise, set_grooming, list_grooming, add_diary, list_diary, add_document, list_documents, add_contact, list_contacts, ask_health, reply\nสคีมาตัวอย่าง: {\"confidence\":0.85,\"reply_hint\":\"...\", \"followup_question\":null, \"actions\":[{\"type\":\"upsert_pet\",\"params\":{\"pet_name\":\"โมจิ\",\"species\":\"dog\"}}]}\nบริบท (JSON): ${JSON.stringify(context).slice(0,1800)}`;
+
+  const out = await geminiChat(sys, userText);
+  if (!out) return null;
+  const cleaned = out.replace(/```json|```/g,'').trim();
+  try{ return JSON.parse(cleaned); }catch{ return null; }
+}
+
+// --- LINE Event Handler ---
+async function handleEvent(event){
+  const userId = event.source?.userId;
+  if (!userId) return;
+
+  // follow: welcome
+  if (event.type === 'follow'){
+    try{
+      const profile = await lineClient.getProfile(userId).catch(()=>({ displayName: 'คุณ' }));
+      await ensureOwner(userId, profile.displayName);
+      const welcome = `สวัสดี ${profile.displayName}! ผมชื่อ \"น้อนน้อน\" 🐾\nผู้ช่วยจดข้อมูลสัตว์เลี้ยงของคุณ\nคุณสามารถพิมพ์ได้เลย เช่น\n- เพิ่มโปรไฟล์หมาชื่อโมจิ เพศผู้ พันธุ์ปอม เกิด 2023-04-01\n- ฉีดวัคซีน Rabies ให้โมจิ วันนี้ นัดอีก 365 วัน\n- ตั้งตารางให้อาหาร 08:00 และ 18:00\n- บันทึกน้ำหนัก 3.4 กก. วันนี้`;
+      return lineClient.replyMessage(event.replyToken, [{ type:'text', text: welcome }]);
+    }catch(e){ logErr('follow error', e.message); }
+  }
+
+  // message: text — Gemini-first planner
+  if (event.type === 'message' && event.message?.type === 'text'){
+    const text = (event.message.text || '').trim();
+
+    // simple menu
+    if (/^เมนู$/i.test(text)){
+      const menu = 'เมนู 🐾\n- เพิ่มสัตว์เลี้ยง\n- บันทึกวัคซีน\n- ดูวัคซีน\n- บันทึก/ดูสุขภาพอื่นๆ (เห็บหมัด หนอนหัวใจ แพ้ ผ่าตัด ยาประจำ น้ำหนัก)\n- ตั้งอาหาร/ออกกำลัง/ทำความสะอาด/ไดอารี่\n- เอกสาร/คอนแทค';
+      return lineClient.replyMessage(event.replyToken, [{ type:'text', text: menu }]);
+    }
+
+    // Planner context
+    const lastPet = await getLastPetName(userId);
+    const context = { last_pet: lastPet };
+
+    let plan = null;
+    try { plan = await geminiPlanner(text, context); } catch(e){ logErr('planner error', e.message); }
+
+    // If planner fails → safe fallback
+    if (!plan){
+      return lineClient.replyMessage(event.replyToken, [{ type:'text', text: 'ระบบกำลังเริ่มต้น โปรดลองใหม่อีกครั้งนะครับ/ค่ะ' }]);
+    }
+
+    // followup question if low confidence
+    if (plan.followup_question && (plan.confidence ?? 0) < 0.6){
+      await setSession(userId, { expect: 'followup', last_plan: plan });
+      return lineClient.replyMessage(event.replyToken, [{ type:'text', text: plan.followup_question }]);
+    }
+
+    // Execute actions
+    let replyText = plan.reply_hint || null;
+
+    const runListFormat = (arr, emptyMsg) => (arr.length ? arr.join('\n') : emptyMsg);
+
+    for (const a of (plan.actions || [])){
+      const p = a.params || {};
+
+      if (a.type === 'add_pet' || a.type === 'upsert_pet'){
+        await upsertPetProfile(userId, p);
+        replyText ||= `อัปเดตโปรไฟล์ \"${p.pet_name || p.name}\" เรียบร้อย ✅`;
+      }
+
+      if (a.type === 'add_vaccine'){
+        const pet = p.pet_name || lastPet || await getLastPetName(userId);
+        if (!pet || !p.vaccine_name || !p.last_shot_date){
+          await setSession(userId, { expect:'fill_add_vaccine' });
+          return lineClient.replyMessage(event.replyToken, [{ type:'text', text:'กรอก: วัคซีนอะไร/ให้ใคร/วันที่ (เช่น “Rabies ให้โมจิ 2025-11-03 รอบ 365”)' }]);
+        }
+        const next = await addVaccine(userId, pet, p.vaccine_name, normalizeDate(p.last_shot_date), Number(p.cycle_days || 365));
+        replyText ||= `บันทึกวัคซีน ${p.vaccine_name} ให้ ${pet} แล้ว นัดถัดไป ${next} ✅`;
+      }
+
+      if (a.type === 'list_vaccine'){
+        const pet = p.pet_name || lastPet || await getLastPetName(userId);
+        if (!pet){
+          replyText ||= 'ยังไม่พบน้องในระบบ บอกชื่อน้องก่อนน้า';
+        } else {
+          const snap = await db.collection('vaccines').where('owner_user_id','==', userId).where('pet_name','==', pet).orderBy('next_due_date','asc').get();
+          if (snap.empty) replyText ||= `ยังไม่มีวัคซีนของ ${pet}`;
+          else {
+            const lines = snap.docs.map(d=>{ const r=d.data(); return `• ${r.vaccine_name} ล่าสุด: ${r.last_shot_date||'-'} นัด: ${r.next_due_date||'-'}`; });
+            replyText ||= runListFormat(lines, `ยังไม่มีวัคซีนของ ${pet}`);
+          }
+        }
+      }
+
+      if (a.type === 'add_parasite_prevention'){
+        const next = await addParasite(userId, p);
+        replyText ||= `บันทึกการป้องกันปรสิตแล้ว ✅${next ? ` นัดถัดไป ${next}` : ''}`;
+      }
+
+      if (a.type === 'add_allergy'){
+        await addAllergy(userId, p);
+        replyText ||= 'บันทึกประวัติแพ้สำเร็จ ✅';
+      }
+
+      if (a.type === 'add_vet'){
+        await addVet(userId, p);
+        replyText ||= 'เพิ่มข้อมูลคลินิก/โรงพยาบาลสำเร็จ ✅';
+      }
+
+      if (a.type === 'add_medical_history'){
+        await addMedicalHistory(userId, p);
+        replyText ||= 'บันทึกประวัติการรักษา/ผ่าตัดสำเร็จ ✅';
+      }
+
+      if (a.type === 'add_medication'){
+        await addMedication(userId, p);
+        replyText ||= 'บันทึกยาที่ใช้อยู่สำเร็จ ✅';
+      }
+
+      if (a.type === 'add_weight'){
+        await addWeight(userId, p);
+        replyText ||= 'บันทึกน้ำหนักเรียบร้อย ✅';
+      }
+
+      if (a.type === 'set_feeding'){
+        await setFeeding(userId, p);
+        replyText ||= 'ตั้งตารางให้อาหารเรียบร้อย ✅';
+      }
+
+      if (a.type === 'add_exercise'){
+        await addExercise(userId, p);
+        replyText ||= 'บันทึกการออกกำลังกายเรียบร้อย ✅';
+      }
+
+      if (a.type === 'set_grooming'){
+        await setGrooming(userId, p);
+        replyText ||= 'บันทึก/ตั้งตาราง Grooming เรียบร้อย ✅';
+      }
+
+      if (a.type === 'add_diary'){
+        await addDiary(userId, p);
+        replyText ||= 'จดไดอารี่พฤติกรรมแล้ว ✅';
+      }
+
+      if (a.type === 'add_document'){
+        await addDocument(userId, p);
+        replyText ||= 'อัปโหลดเอกสารแล้ว ✅';
+      }
+
+      if (a.type === 'add_contact'){
+        await addContact(userId, p);
+        replyText ||= 'เพิ่มข้อมูลติดต่อเรียบร้อย ✅';
+      }
+
+      if (a.type === 'ask_health'){
+        const ans = await geminiChat(
+          'คุณคือน้อนน้อน ให้คำแนะนำสุขภาพสัตว์ทั่วไป (ไม่วินิจฉัย/ไม่สั่งยา) เป็น bullet สั้นๆ + เตือนพบสัตวแพทย์เมื่อมีสัญญาณอันตราย',
+          `คำถาม: ${p.question || text}\nสัตว์: ${p.species || 'unknown'} ชื่อ: ${p.pet_name || (lastPet||'-')}`
+        );
+        replyText ||= ans || 'ขอโทษนะคะ/ครับ ตอนนี้น้อนน้อนยังตอบเรื่องนี้ไม่ได้';
+      }
+
+      if (a.type === 'reply'){
+        replyText ||= p.text || null;
+      }
+    }
+
+    const finalReply = replyText || 'สำเร็จ';
+    return lineClient.replyMessage(event.replyToken, [{ type:'text', text: finalReply }]);
+  }
+
+  // Postbacks, images, etc. can be added here if needed
+}
+
+// --- Start server ---
+app.listen(cfg.port, () => log('Server running on', cfg.port));
