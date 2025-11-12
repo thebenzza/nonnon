@@ -1,3 +1,4 @@
+// version: 1.3.0 — 2025-11-12T16:00+07:00
 // server.js — Nonnon (น้อนน้อน) LINE Bot with Firebase + Gemini Planner (No-Keyword)
 // Node >= 18, package.json should include: "type":"module"
 // ENV required:
@@ -24,7 +25,7 @@ const cfg = {
   },
   gemini: {
     apiKey: process.env.GEMINI_API_KEY,
-    defaultModel: 'gemini-2.5-flash', // fast & capable; switch to pro when needed
+    defaultModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash', // fast & capable; switch to pro when needed
   },
   log: process.env.LOG_LEVEL || 'info',
 };
@@ -66,6 +67,7 @@ app.set('trust proxy', true);
 
 // Minimal health
 app.get('/', (_req, res) => res.send('Nonnon Pet Bot OK'));
+app.get('/debug/version', (_req, res) => res.json({ ok:true, version: '1.3.0', model: cfg.gemini.defaultModel, tz: cfg.tz }));
 
 // Debug Firestore
 app.get('/debug/firestore', async (_req, res) => {
