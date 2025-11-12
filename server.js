@@ -1,4 +1,4 @@
-// version: 1.3.0 — 2025-11-12T16:00+07:00
+// version: 1.3.0 — 2025-11-12T16:00+07:001
 // server.js — Nonnon (น้อนน้อน) LINE Bot with Firebase + Gemini Planner (No-Keyword)
 // Node >= 18, package.json should include: "type":"module"
 // ENV required:
